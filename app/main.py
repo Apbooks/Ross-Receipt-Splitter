@@ -1,22 +1,29 @@
 from __future__ import annotations
 
+import json
+import shutil
+import uuid
 from contextlib import asynccontextmanager
 from datetime import date
 from decimal import Decimal, ROUND_DOWN
 from pathlib import Path
 
-from fastapi import Depends, FastAPI, Form, HTTPException, Request
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from sqlalchemy import Boolean, Date, ForeignKey, Integer, String, create_engine, select
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship, sessionmaker
 
+from app.ocr import extract_text, parse_receipt_text
+
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR.parent / "data"
-DATA_DIR.mkdir(exist_ok=True)
+UPLOAD_DIR = DATA_DIR / "uploads"
+OCR_DIR = DATA_DIR / "ocr_drafts"
+for directory in (DATA_DIR, UPLOAD_DIR, OCR_DIR):
+    directory.mkdir(exist_ok=True)
 DATABASE_URL = f"sqlite:///{DATA_DIR / 'ross_splitter.db'}"
-
 engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
 SessionLocal = sessionmaker(bind=engine, expire_on_commit=False)
 
@@ -93,8 +100,7 @@ def allocate_tax(receipt: Receipt) -> dict[int, int]:
     exact = [(item.id, Decimal(receipt.tax_cents) * Decimal(item.net_cents) / Decimal(taxable_total)) for item in assigned]
     allocated = {item_id: int(share.quantize(Decimal("1"), rounding=ROUND_DOWN)) for item_id, share in exact}
     remainder = receipt.tax_cents - sum(allocated.values())
-    ranked = sorted(exact, key=lambda pair: pair[1] - int(pair[1]), reverse=True)
-    for item_id, _ in ranked[:remainder]:
+    for item_id, _ in sorted(exact, key=lambda pair: pair[1] - int(pair[1]), reverse=True)[:remainder]:
         allocated[item_id] += 1
     return allocated
 
@@ -159,6 +165,43 @@ def receipt_page(receipt_id: int, request: Request, db: Session = Depends(get_db
     receipt = db.get(Receipt, receipt_id)
     if not receipt: raise HTTPException(404, "Receipt not found")
     return templates.TemplateResponse(request, "receipt.html", {"receipt": receipt, "summary": receipt_summary(receipt)})
+
+@app.post("/receipts/{receipt_id}/ocr")
+def upload_receipt_ocr(receipt_id: int, receipt_image: UploadFile = File(...), db: Session = Depends(get_db)):
+    if not db.get(Receipt, receipt_id): raise HTTPException(404, "Receipt not found")
+    if receipt_image.content_type not in {"image/jpeg", "image/png", "image/webp"}:
+        raise HTTPException(400, "Upload a JPG, PNG, or WebP image.")
+    draft_id = uuid.uuid4().hex
+    suffix = Path(receipt_image.filename or "receipt.jpg").suffix.lower() or ".jpg"
+    original = UPLOAD_DIR / f"{draft_id}{suffix}"
+    processed = UPLOAD_DIR / f"{draft_id}-processed.png"
+    with original.open("wb") as destination:
+        shutil.copyfileobj(receipt_image.file, destination)
+    raw_text = extract_text(original, processed)
+    draft = {"id": draft_id, "receipt_id": receipt_id, "raw_text": raw_text, "items": parse_receipt_text(raw_text), "original": original.name, "processed": processed.name}
+    (OCR_DIR / f"{draft_id}.json").write_text(json.dumps(draft, indent=2), encoding="utf-8")
+    return RedirectResponse(f"/receipts/{receipt_id}/ocr/{draft_id}", status_code=303)
+
+@app.get("/receipts/{receipt_id}/ocr/{draft_id}", response_class=HTMLResponse)
+def review_receipt_ocr(receipt_id: int, draft_id: str, request: Request, db: Session = Depends(get_db)):
+    receipt = db.get(Receipt, receipt_id); path = OCR_DIR / f"{draft_id}.json"
+    if not receipt or not path.exists(): raise HTTPException(404, "OCR draft not found")
+    draft = json.loads(path.read_text(encoding="utf-8"))
+    if draft["receipt_id"] != receipt_id: raise HTTPException(400, "OCR draft does not belong to this receipt")
+    return templates.TemplateResponse(request, "receipt_ocr_review.html", {"receipt": receipt, "draft": draft})
+
+@app.post("/receipts/{receipt_id}/ocr/{draft_id}/confirm")
+async def confirm_receipt_ocr(receipt_id: int, draft_id: str, request: Request, db: Session = Depends(get_db)):
+    receipt = db.get(Receipt, receipt_id); path = OCR_DIR / f"{draft_id}.json"
+    if not receipt or not path.exists(): raise HTTPException(404, "OCR draft not found")
+    form = await request.form(); count = int(form.get("count", 0))
+    for index in range(count):
+        identifier = str(form.get(f"identifier_{index}", "")).strip()
+        price = str(form.get(f"price_{index}", "")).strip()
+        if not identifier or not price: continue
+        db.add(ReceiptItem(receipt_id=receipt_id, description=str(form.get(f"description_{index}", "Receipt item")).strip() or "Receipt item", identifier=identifier, original_price_cents=parse_money(price), discount_cents=parse_money(str(form.get(f"discount_{index}", "0"))), taxable=f"taxable_{index}" in form))
+    db.commit(); path.unlink(missing_ok=True)
+    return RedirectResponse(f"/receipts/{receipt_id}?ocr_imported=1", status_code=303)
 
 @app.post("/receipts/{receipt_id}/items")
 def add_item(receipt_id: int, description: str = Form("Item"), identifier: str = Form(...), original_price: str = Form(...), discount: str = Form("0"), taxable: bool = Form(False), db: Session = Depends(get_db)):
