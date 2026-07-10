@@ -6,7 +6,10 @@ from pathlib import Path
 
 import cv2
 import pytesseract
-from PIL import Image, ImageOps
+from PIL import Image, ImageOps, UnidentifiedImageError
+from pillow_heif import register_heif_opener
+
+register_heif_opener()
 
 MONEY_RE = re.compile(r"(?P<amount>-?\$?\d+[.,]\d{2})\s*-?$")
 DIGITS_RE = re.compile(r"\d{4,}")
@@ -37,12 +40,16 @@ def preprocess_image(source: Path, output: Path) -> None:
                 height = round(corrected.height * 2200 / corrected.width)
                 corrected = corrected.resize((2200, height))
             corrected.save(source, format="JPEG", quality=94)
+    except UnidentifiedImageError as exc:
+        raise ValueError(
+            "The selected file is not a readable photo. On iPhone, choose a receipt image from Photos or take a new picture."
+        ) from exc
     except Exception as exc:
         raise ValueError(f"The uploaded image could not be prepared: {exc}") from exc
 
     image = cv2.imread(str(source))
     if image is None:
-        raise ValueError("The uploaded image could not be read.")
+        raise ValueError("The uploaded image could not be read after conversion.")
     _, width = image.shape[:2]
     if width < 1600:
         scale = 1600 / width
