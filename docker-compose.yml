@@ -1,0 +1,9 @@
+services:
+  ross-receipt-splitter:
+    build: .
+    container_name: ross-receipt-splitter
+    restart: unless-stopped
+    ports:
+      - "8088:8000"
+    volumes:
+      - ./data:/app/data
